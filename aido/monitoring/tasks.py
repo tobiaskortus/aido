@@ -1,105 +1,133 @@
 import os
+import json
 import shlex
+import inspect
+import shutil
+import tempfile
+import subprocess
 import numpy as np
 import pandas as pd
+import importlib.util
 from enum import Enum
-from typing import Any, Optional, Sequence, Tuple
+from typing import Optional
 
 from aido.monitoring.logger import WandbTaskLogger
+from aido.monitoring.client import WandbTaskLoggerClient
 
 class TaskType(Enum):
     RECONSTRUCTION = 0
 
-class OutputConfig:
-    def __init__(self, output_dir: str, file_mapping: dict, key_mapping: dict):
-        self.output_dir = output_dir
-        self.file_mapping = file_mapping
-        self.key_mapping = key_mapping
-
-        assert self.file_mapping.keys() == self.key_mapping.keys(), \
-            "File_mapping and key_mapping must have the same keys."
-
-    @classmethod
-    def __default_dict_from_task_type(cls, task_type: TaskType) -> dict:
-        match task_type:
-            case TaskType.RECONSTRUCTION:
-                return { "Reconstruction Loss": "loss/reconstruction/reconstruction_loss" }
-        
-        raise ValueError(f"OutputConfig: No default file mapping for task type {task_type}")
-
-
-    @classmethod
-    def __default_key_mapping_from_task_type(cls, task_type: TaskType) -> dict:
-        match task_type:
-            case TaskType.RECONSTRUCTION:
-                return { "Reconstruction Loss": "Reconstruction Loss" }
-        
-        raise ValueError(f"OutputConfig: No default key mapping for task type {task_type}")
-
-    @classmethod
-    def create_default(cls, output_dir: str, task_type: TaskType) -> 'OutputConfig':
-        file_mapping = cls.__default_dict_from_task_type(task_type)
-        key_mapping = cls.__default_key_mapping_from_task_type(task_type)
-
-        return OutputConfig(output_dir, file_mapping, key_mapping)
-
-
 class WandbSubprocessWrapper:
-    def __init__(self, command: str, subprocess_logger: Optional[WandbTaskLogger] = None, 
-                 output_config: Optional[OutputConfig] = None, requires_loss_file: bool = False): 
-        
+    def __init__(self, command: str, subprocess_logger: Optional[WandbTaskLogger] = None,
+                 patch_client: bool = False, raise_on_error: bool = False):
+        """Wrapper to run a subprocess command and log its monitoring output.
+        Args:
+            command (str): The command to run as a subprocess.
+            subprocess_logger (Optional[WandbTaskLogger]): WandbTaskLogger to log monitoring data.
+        """
         self.command = command
-        self.output_config = output_config
+        self.patch_client = patch_client
+        self.raise_on_error = raise_on_error
         self.subprocess_logger = subprocess_logger
-        self.requires_loss_file = requires_loss_file
-        
-        if subprocess_logger is not None:
-            assert output_config is not None, "OutputConfig must be provided if subprocess_logger is used."
 
-
-    @staticmethod
-    def save_loss_to_file(loss: Sequence[Any], filepath: str, step_offset: int = 0) -> None:
-        pd.DataFrame(
-            np.array(loss),
-            np.arange(step_offset, step_offset + len(loss)),
-            columns=["Reconstruction Loss", "Step"]
-        ).to_csv(os.path.join(filepath), index=True)
-
-
-    @staticmethod
-    def load_loss_from_file(filepath: str) -> Tuple[pd.DataFrame, int]:
-        df = pd.read_csv(os.path.join(filepath))
-        try: step_offset = df["Step"].min()
-        except KeyError: step_offset = 0
-        return df, step_offset
-
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.patch_root is not None:
+            shutil.rmtree(self.patch_root)
 
     def run(self, *args):
+        patch_args = []
+        container_type = None
         command_list = shlex.split(self.command)
+
+        if len(command_list) > 0:
+            if command_list[0] == 'docker':
+                container_type = 'docker'
+            elif command_list[0] == 'singularity':
+                container_type = 'singularity'
+
+        if self.patch_client and container_type is not None:
+            patch_args = self._patch_wandb_logger_client(container_type=container_type or 'singularity')
+
+        if patch_args:
+            for idx, token in enumerate(command_list):
+                if token in ('exec', 'run'):
+                    insert_idx = idx + 1
+                    break
+            else:
+                insert_idx = 0
+            command_list = command_list[:insert_idx] + patch_args + command_list[insert_idx:]
+
         command_list.extend(map(str, args))
         full_command = shlex.join(command_list)
-        os.system(full_command)
 
-        self.log_subprocess_output()
+        if self.subprocess_logger is not None:
+            proc = subprocess.Popen(full_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                    self._process_monitoring_message(msg)
+                except json.JSONDecodeError as e:
+                    print(line)
+                except Exception as e:
+                    if self.raise_on_error:
+                        raise Exception(f"Exception: {line.strip()} ({e})")
+                    raise e
+            proc.wait()
+            if proc.returncode != 0:
+                err = proc.stderr.read()
+                print(f"[WandbSubprocessWrapper] Subprocess exited with code {proc.returncode}.")
+                if err:
+                    print(f"[WandbSubprocessWrapper] Subprocess stderr:\n{err}")
+        else:
+            os.system(full_command)
 
-    def log_subprocess_output(self):
+    def _patch_wandb_logger_client(self, container_type: str = "singularity") -> list[str]:
+        """Patch the WandbTaskLoggerClient inside the container by creating a temporary 
+        directory with the module code. Requires that WandbTaskLoggerClient reqzuires no 
+        additional dependencies beyond the standard library."""
+
+        self.patch_root = tempfile.mkdtemp(prefix="aido_patches_")
+        module_path = WandbTaskLoggerClient.__module__
+        parts = module_path.split(".")
+        dir_path = os.path.join(self.patch_root, *parts[:-1])
+        os.makedirs(dir_path, exist_ok=True)
+
+        spec = importlib.util.find_spec(module_path)
+        if spec is None or not spec.origin:
+            raise RuntimeError(f"Could not find source file for module {module_path}")
+        with open(spec.origin, "r") as src, open(os.path.join(dir_path, f"{parts[-1]}.py"), "w") as dst:
+            dst.write(src.read())
+
+        for i in range(1, len(parts)):
+            p = os.path.join(self.patch_root, *parts[:i])
+            init_file = os.path.join(p, "__init__.py")
+            if not os.path.exists(init_file):
+                with open(init_file, "w") as f:
+                    f.write("# autogenerated __init__.py\n")
+
+        if container_type == "docker":
+            args = ["-v", f"{self.patch_root}:/patches",
+                    "-e", "PYTHONPATH=/patches"]
+        elif container_type == "singularity":
+            args = ["-B", f"{self.patch_root}:/patches",
+                    "--env", "PYTHONPATH=/patches"]
+        else:
+            raise ValueError(f"Unknown container_type: {container_type}")
+        return args
+
+
+    def _process_monitoring_message(self, msg):
         if self.subprocess_logger is None:
             return
-        
-        try:
-            for key, filename in self.output_config.file_mapping.items():
-                filepath = os.path.join(self.output_config.output_dir, filename)
-                df_key = self.output_config.key_mapping.get(key, None)
-                if df_key is None:
-                    raise Exception(f"No key mapping found for key: {key}.")
-                
-                df, step_offset = WandbSubprocessWrapper.load_loss_from_file(filepath)
-                self.subprocess_logger.log_scalars(key, df[df_key].values, step_offset)
 
-
-        except FileNotFoundError as e:
-            # Ignore error if loss file is not required
-            if not self.requires_loss_file:
-                print(f"Subprocess output file {filepath} not found.")
-                return
-            raise e
+        if msg.get("type") == "scalars":
+            key = msg.get("key", "scalars")
+            scalars = msg.get("scalars", [])
+            step_offset = msg.get("step_offset", None)
+            self.subprocess_logger.log_scalars(key, scalars, step_offset)

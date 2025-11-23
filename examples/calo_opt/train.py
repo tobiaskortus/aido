@@ -8,6 +8,7 @@ from typing import Union
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
+from aido.monitoring.client import WandbTaskLoggerClient
 
 sys.path.append(os.path.abspath(pathlib.Path(__file__).parent.parent))
 
@@ -80,11 +81,8 @@ def train(
 
         loss = reco_model.reconstruction_loss[reco_model.step_offset:]
         step_offset = reco_model.step_offset
-
-        pd.DataFrame({
-            "Reconstruction Loss": np.array(loss),
-            "Step": np.arange(step_offset, step_offset + len(loss), 1)
-        }).to_csv(os.path.join(path, "reconstruction_loss"), index=True)
+        client = WandbTaskLoggerClient()
+        client.log_scalars("Reconstruction Loss", loss, step_offset=step_offset)
 
         validator = ReconstructionValidation(reco_model)
         output_df_val = validator.validate(reco_dataset)
